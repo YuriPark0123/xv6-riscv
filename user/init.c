@@ -24,7 +24,7 @@ main(void)
   dup(0);  // stderr
 
   for(;;){
-    printf("init: starting sh\n");
+    printf("init: starting sh\nStudent ID: 2023315983\nName: Yuri Park\n");
     pid = fork();
     if(pid < 0){
       printf("init: fork failed\n");
