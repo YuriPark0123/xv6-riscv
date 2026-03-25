@@ -146,6 +146,8 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  p->nice = 20;
+
   return p;
 }
 
@@ -168,6 +170,7 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  p->nice = 0;
   p->state = UNUSED;
 }
 
@@ -287,6 +290,8 @@ kfork(void)
     if(p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
+
+  np->nice = p->nice;
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
@@ -656,6 +661,128 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
   } else {
     memmove(dst, (char*)src, len);
     return 0;
+  }
+}
+
+int
+getnice(int pid)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid && p->state != UNUSED){
+      int nice = p->nice;
+      release(&p->lock);
+      return nice;
+    }
+    release(&p->lock);
+  }
+  return -1;
+}
+
+int
+setnice(int pid, int value)
+{
+  struct proc *p;
+
+  if(value < 0 || value > 39)
+    return -1;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid && p->state != UNUSED){
+      p->nice = value;
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;
+}
+
+void
+kps(int pid)
+{
+  static char *states[] = {
+  [UNUSED]    "unused",
+  [USED]      "used",
+  [SLEEPING]  "sleeping",
+  [RUNNABLE]  "runnable",
+  [RUNNING]   "running",
+  [ZOMBIE]    "zombie"
+  };
+  struct proc *p;
+  char *state;
+  int found = 0;
+
+  // For a specific pid, check if it exists first
+  if(pid != 0){
+    for(p = proc; p < &proc[NPROC]; p++){
+      acquire(&p->lock);
+      if(p->state != UNUSED && p->pid == pid){
+        found = 1;
+        release(&p->lock);
+        break;
+      }
+      release(&p->lock);
+    }
+    if(!found)
+      return;
+  }
+
+  printf("name\tpid\tstate\t\tpriority\n");
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state != UNUSED){
+      if(pid == 0 || p->pid == pid){
+        if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
+          state = states[p->state];
+        else
+          state = "???";
+        printf("%s\t%d\t%s\t\t%d\n", p->name, p->pid, state, p->nice);
+      }
+    }
+    release(&p->lock);
+  }
+}
+
+int
+kwaitpid(int pid)
+{
+  struct proc *pp;
+  int found;
+  struct proc *p = myproc();
+
+  acquire(&wait_lock);
+
+  for(;;){
+    found = 0;
+    for(pp = proc; pp < &proc[NPROC]; pp++){
+      if(pp->pid == pid){
+        acquire(&pp->lock);
+        if(pp->parent != p){
+          release(&pp->lock);
+          release(&wait_lock);
+          return -1;
+        }
+        found = 1;
+        if(pp->state == ZOMBIE){
+          freeproc(pp);
+          release(&pp->lock);
+          release(&wait_lock);
+          return 0;
+        }
+        release(&pp->lock);
+      }
+    }
+
+    if(!found || killed(p)){
+      release(&wait_lock);
+      return -1;
+    }
+
+    sleep(p, &wait_lock);
   }
 }
 
