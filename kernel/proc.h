@@ -105,4 +105,9 @@ struct proc {
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
   int nice;                    // Nice value (0-39, default 20)
+  int weight;                  // Weight derived from nice
+  uint64 runtime;              // Actual runtime in milliticks
+  uint64 vruntime;             // Virtual runtime in milliticks
+  uint64 vdeadline;            // Virtual deadline in milliticks
+  int time_slice;              // Remaining time slice in ticks
 };

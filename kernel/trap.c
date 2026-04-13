@@ -80,9 +80,11 @@ usertrap(void)
   if(killed(p))
     kexit(-1);
 
-  // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
+  // give up the CPU if this is a timer interrupt and time slice expired.
+  if(which_dev == 2){
+    if(proc_tick())
+      yield();
+  }
 
   prepare_return();
 
@@ -151,9 +153,11 @@ kerneltrap()
     panic("kerneltrap");
   }
 
-  // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2 && myproc() != 0)
-    yield();
+  // give up the CPU if this is a timer interrupt and time slice expired.
+  if(which_dev == 2 && myproc() != 0){
+    if(proc_tick())
+      yield();
+  }
 
   // the yield() may have caused some traps to occur,
   // so restore trap registers for use by kernelvec.S's sepc instruction.
@@ -172,9 +176,9 @@ clockintr()
   }
 
   // ask for the next timer interrupt. this also clears
-  // the interrupt request. 1000000 is about a tenth
+  // the interrupt request. 100000 is about a thousandth
   // of a second.
-  w_stimecmp(r_time() + 1000000);
+  w_stimecmp(r_time() + 100000);
 }
 
 // check if it's an external interrupt or software interrupt,

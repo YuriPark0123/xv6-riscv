@@ -106,6 +106,7 @@ int             getnice(int);
 int             setnice(int, int);
 void            kps(int);
 int             kwaitpid(int);
+int             proc_tick(void);
 
 // swtch.S
 void            swtch(struct context*, struct context*);
