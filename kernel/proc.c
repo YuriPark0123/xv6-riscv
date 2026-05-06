@@ -326,6 +326,9 @@ kfork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+  // Copy mmap_areas from parent to child
+  mmap_fork(p, np);
+
   pid = np->pid;
 
   release(&np->lock);
@@ -366,6 +369,9 @@ kexit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // Cleanup mmap regions before closing files
+  mmap_cleanup(p);
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

@@ -71,6 +71,9 @@ usertrap(void)
   } else if((r_scause() == 15 || r_scause() == 13) &&
             vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
     // page fault on lazily-allocated page
+  } else if((r_scause() == 13 || r_scause() == 15) &&
+            mmap_page_fault(r_stval(), (r_scause() == 15) ? 1 : 0) == 1) {
+    // page fault on mmap region handled successfully
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());

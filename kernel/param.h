@@ -13,3 +13,12 @@
 #define MAXPATH      128   // maximum file path name
 #define USERSTACK    1     // user stack pages
 
+#define MMAPBASE     0x40000000  // base virtual address for mmap regions
+#define NMMAPAREA    64          // maximum number of mmap_area entries
+
+#define PROT_READ    0x1
+#define PROT_WRITE   0x2
+
+#define MAP_ANONYMOUS 0x1
+#define MAP_POPULATE  0x2
+
