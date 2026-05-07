@@ -106,7 +106,6 @@ int             getnice(int);
 int             setnice(int, int);
 void            kps(int);
 int             kwaitpid(int);
-int             proc_tick(void);
 
 // swtch.S
 void            swtch(struct context*, struct context*);
@@ -188,6 +187,7 @@ void            virtio_disk_rw(struct buf *, int);
 void            virtio_disk_intr(void);
 
 // mmap.c
+void            mmap_init(void);
 int             mmap_page_fault(uint64, int);
 void            mmap_fork(struct proc*, struct proc*);
 void            mmap_cleanup(struct proc*);

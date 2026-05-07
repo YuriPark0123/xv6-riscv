@@ -28,6 +28,7 @@ main()
     iinit();         // inode table
     fileinit();      // file table
     virtio_disk_init(); // emulated hard disk
+    mmap_init();     // mmap_area table
     userinit();      // first user process
     __sync_synchronize();
     started = 1;

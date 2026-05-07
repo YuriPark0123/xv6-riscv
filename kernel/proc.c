@@ -10,22 +10,6 @@ struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
 
-// Nice-to-weight table (Linux sched_prio_to_weight)
-// weight = 1024 / 1.25^(nice-20), pre-computed
-static const int weight_table[40] = {
-  /* nice  0 */ 88761, 71755, 56483, 46273, 36291,
-  /* nice  5 */ 29154, 23254, 18705, 14949, 11916,
-  /* nice 10 */  9548,  7620,  6100,  4904,  3906,
-  /* nice 15 */  3121,  2501,  1991,  1586,  1277,
-  /* nice 20 */  1024,   820,   655,   526,   423,
-  /* nice 25 */   335,   272,   215,   172,   137,
-  /* nice 30 */   110,    87,    70,    56,    45,
-  /* nice 35 */    36,    29,    23,    18,    15,
-};
-
-#define BASE_TIME_SLICE 5
-#define NICE0_WEIGHT 1024
-
 struct proc *initproc;
 
 int nextpid = 1;
@@ -163,11 +147,6 @@ found:
   p->context.sp = p->kstack + PGSIZE;
 
   p->nice = 20;
-  p->weight = weight_table[20];
-  p->runtime = 0;
-  p->vruntime = 0;
-  p->vdeadline = (uint64)BASE_TIME_SLICE * 1000 * NICE0_WEIGHT / p->weight;
-  p->time_slice = BASE_TIME_SLICE;
 
   return p;
 }
@@ -192,11 +171,6 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->nice = 0;
-  p->weight = 0;
-  p->runtime = 0;
-  p->vruntime = 0;
-  p->vdeadline = 0;
-  p->time_slice = 0;
   p->state = UNUSED;
 }
 
@@ -318,11 +292,6 @@ kfork(void)
   np->cwd = idup(p->cwd);
 
   np->nice = p->nice;
-  np->weight = p->weight;
-  np->runtime = 0;
-  np->vruntime = p->vruntime;
-  np->time_slice = BASE_TIME_SLICE;
-  np->vdeadline = np->vruntime + (uint64)BASE_TIME_SLICE * 1000 * NICE0_WEIGHT / np->weight;
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
@@ -456,8 +425,13 @@ kwait(uint64 addr)
   }
 }
 
-// EEVDF scheduler.
-// Picks the eligible process with the earliest virtual deadline.
+// Per-CPU process scheduler.
+// Each CPU calls scheduler() after setting itself up.
+// Scheduler never returns.  It loops, doing:
+//  - choose a process to run.
+//  - swtch to start running that process.
+//  - eventually that process transfers control
+//    via swtch back to the scheduler.
 void
 scheduler(void)
 {
@@ -466,52 +440,34 @@ scheduler(void)
 
   c->proc = 0;
   for(;;){
+    // The most recent process to run may have had interrupts
+    // turned off; enable them to avoid a deadlock if all
+    // processes are waiting. Then turn them back off
+    // to avoid a possible race between an interrupt
+    // and wfi.
     intr_on();
     intr_off();
 
-    // Step 1: Find v0 (minimum vruntime among RUNNABLE)
-    uint64 v0 = (uint64)-1;
-    for(p = proc; p < &proc[NPROC]; p++){
-      if(p->state == RUNNABLE && p->vruntime < v0)
-        v0 = p->vruntime;
-    }
+    int found = 0;
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->state == RUNNABLE) {
+        // Switch to chosen process.  It is the process's job
+        // to release its lock and then reacquire it
+        // before jumping back to us.
+        p->state = RUNNING;
+        c->proc = p;
+        swtch(&c->context, &p->context);
 
-    if(v0 == (uint64)-1){
-      asm volatile("wfi");
-      continue;
-    }
-
-    // Step 2: Compute sum_vw = Σ((vi-v0)*wi) and sum_w = Σwi
-    uint64 sum_vw = 0;
-    uint64 sum_w = 0;
-    for(p = proc; p < &proc[NPROC]; p++){
-      if(p->state == RUNNABLE){
-        sum_vw += (p->vruntime - v0) * (uint64)p->weight;
-        sum_w += (uint64)p->weight;
+        // Process is done running for now.
+        // It should have changed its p->state before coming back.
+        c->proc = 0;
+        found = 1;
       }
+      release(&p->lock);
     }
-
-    // Step 3: Find eligible process with earliest vdeadline
-    // Eligible if: sum_vw >= (vi - v0) * sum_w
-    struct proc *best = 0;
-    for(p = proc; p < &proc[NPROC]; p++){
-      if(p->state == RUNNABLE){
-        uint64 rhs = (p->vruntime - v0) * sum_w;
-        if(sum_vw >= rhs){
-          if(best == 0 || p->vdeadline < best->vdeadline)
-            best = p;
-        }
-      }
-    }
-
-    if(best){
-      acquire(&best->lock);
-      best->state = RUNNING;
-      c->proc = best;
-      swtch(&c->context, &best->context);
-      c->proc = 0;
-      release(&best->lock);
-    } else {
+    if(found == 0) {
+      // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
     }
   }
@@ -634,8 +590,6 @@ wakeup(void *chan)
     if(p != myproc()){
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
-        p->time_slice = BASE_TIME_SLICE;
-        p->vdeadline = p->vruntime + (uint64)BASE_TIME_SLICE * 1000 * NICE0_WEIGHT / p->weight;
         p->state = RUNNABLE;
       }
       release(&p->lock);
@@ -657,8 +611,6 @@ kkill(int pid)
       p->killed = 1;
       if(p->state == SLEEPING){
         // Wake process from sleep().
-        p->time_slice = BASE_TIME_SLICE;
-        p->vdeadline = p->vruntime + (uint64)BASE_TIME_SLICE * 1000 * NICE0_WEIGHT / p->weight;
         p->state = RUNNABLE;
       }
       release(&p->lock);
@@ -747,8 +699,6 @@ setnice(int pid, int value)
     acquire(&p->lock);
     if(p->pid == pid && p->state != UNUSED){
       p->nice = value;
-      p->weight = weight_table[value];
-      p->vdeadline = p->vruntime + (uint64)BASE_TIME_SLICE * 1000 * NICE0_WEIGHT / p->weight;
       release(&p->lock);
       return 0;
     }
@@ -763,9 +713,9 @@ kps(int pid)
   static char *states[] = {
   [UNUSED]    "unused",
   [USED]      "used",
-  [SLEEPING]  "sleep",
-  [RUNNABLE]  "runble",
-  [RUNNING]   "run",
+  [SLEEPING]  "sleeping",
+  [RUNNABLE]  "runnable",
+  [RUNNING]   "running",
   [ZOMBIE]    "zombie"
   };
   struct proc *p;
@@ -787,33 +737,7 @@ kps(int pid)
       return;
   }
 
-  // Compute eligibility parameters from RUNNABLE/RUNNING processes
-  uint64 v0 = (uint64)-1;
-  uint64 sum_vw = 0;
-  uint64 sum_w = 0;
-
-  for(p = proc; p < &proc[NPROC]; p++){
-    if((p->state == RUNNABLE || p->state == RUNNING) && p->vruntime < v0)
-      v0 = p->vruntime;
-  }
-  if(v0 == (uint64)-1)
-    v0 = 0;
-
-  for(p = proc; p < &proc[NPROC]; p++){
-    if(p->state == RUNNABLE || p->state == RUNNING){
-      sum_vw += (p->vruntime - v0) * (uint64)p->weight;
-      sum_w += (uint64)p->weight;
-    }
-  }
-
-  // Get current tick
-  uint xticks;
-  acquire(&tickslock);
-  xticks = ticks;
-  release(&tickslock);
-
-  printf("name\tpid\tstate\tpriority\truntime/weight\truntime\tvruntime\tvdeadline\tis_eligible\ttick %d\n",
-         (int)(xticks * 1000));
+  printf("name\tpid\tstate\t\tpriority\n");
   for(p = proc; p < &proc[NPROC]; p++){
     acquire(&p->lock);
     if(p->state != UNUSED){
@@ -822,34 +746,7 @@ kps(int pid)
           state = states[p->state];
         else
           state = "???";
-
-        // Compute runtime/weight
-        int rw = 0;
-        if(p->weight > 0)
-          rw = (int)(p->runtime / (uint64)p->weight);
-
-        // Compute eligibility
-        char *eligible = "true";
-        if(sum_w > 0 && (p->state == RUNNABLE || p->state == RUNNING)){
-          uint64 rhs = (p->vruntime - v0) * sum_w;
-          if(sum_vw < rhs)
-            eligible = "false";
-        } else if(p->state == SLEEPING || p->state == ZOMBIE){
-          // For sleeping/zombie, check against run queue
-          if(sum_w > 0 && p->vruntime > v0){
-            uint64 rhs = (p->vruntime - v0) * sum_w;
-            if(sum_vw < rhs)
-              eligible = "false";
-          }
-        }
-
-        printf("%s\t%d\t%s\t%d\t\t%d\t%d\t%d\t%d\t\t%s\n",
-               p->name, p->pid, state, p->nice,
-               rw,
-               (int)p->runtime,
-               (int)p->vruntime,
-               (int)p->vdeadline,
-               eligible);
+        printf("%s\t%d\t%s\t\t%d\n", p->name, p->pid, state, p->nice);
       }
     }
     release(&p->lock);
@@ -893,30 +790,6 @@ kwaitpid(int pid)
 
     sleep(p, &wait_lock);
   }
-}
-
-// Called on each timer tick for the running process.
-// Returns 1 if the process should yield, 0 otherwise.
-int
-proc_tick(void)
-{
-  struct proc *p = myproc();
-  if(p == 0)
-    return 0;
-
-  acquire(&p->lock);
-  p->runtime += 1000;
-  p->vruntime += 1000 * NICE0_WEIGHT / (uint64)p->weight;
-  p->time_slice--;
-
-  int should_yield = 0;
-  if(p->time_slice <= 0){
-    p->vdeadline = p->vruntime + (uint64)BASE_TIME_SLICE * 1000 * NICE0_WEIGHT / p->weight;
-    p->time_slice = BASE_TIME_SLICE;
-    should_yield = 1;
-  }
-  release(&p->lock);
-  return should_yield;
 }
 
 // Print a process listing to console.  For debugging.

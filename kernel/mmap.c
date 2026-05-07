@@ -10,7 +10,16 @@
 #include "sleeplock.h"
 #include "file.h"
 
-struct mmap_area mmap_areas[NMMAPAREA];
+struct {
+  struct spinlock lock;
+  struct mmap_area entries[NMMAPAREA];
+} mmap_table;
+
+void
+mmap_init(void)
+{
+  initlock(&mmap_table.lock, "mmap");
+}
 
 static int
 mmap_alloc_page(pagetable_t pagetable, uint64 va, int prot,
@@ -26,7 +35,6 @@ mmap_alloc_page(pagetable_t pagetable, uint64 va, int prot,
   memset(mem, 0, PGSIZE);
 
   if(!is_anon && f){
-    // Read file content into the physical page
     ilock(f->ip);
     readi(f->ip, 0, (uint64)mem, offset, PGSIZE);
     iunlock(f->ip);
@@ -62,59 +70,59 @@ sys_mmap(void)
 
   va = MMAPBASE + addr;
 
-  // Check page alignment
   if(va % PGSIZE != 0)
+    return 0;
+  if(length <= 0 || (length % PGSIZE) != 0)
     return 0;
 
   int is_anon = (flags & MAP_ANONYMOUS) != 0;
 
   if(!is_anon){
-    // File mapping: validate fd
     if(fd < 0 || fd >= NOFILE || p->ofile[fd] == 0)
       return 0;
     f = p->ofile[fd];
 
-    // Check prot matches file open mode
     if((prot & PROT_READ) && !f->readable)
       return 0;
     if((prot & PROT_WRITE) && !f->writable)
       return 0;
   }
 
-  // Find a free mmap_area slot
+  acquire(&mmap_table.lock);
   int slot = -1;
   for(int i = 0; i < NMMAPAREA; i++){
-    if(mmap_areas[i].p == 0){
+    if(mmap_table.entries[i].p == 0){
       slot = i;
       break;
     }
   }
-  if(slot == -1)
+  if(slot == -1){
+    release(&mmap_table.lock);
     return 0;
+  }
 
-  // Record the mapping
-  mmap_areas[slot].f = f;
-  mmap_areas[slot].addr = va;
-  mmap_areas[slot].length = length;
-  mmap_areas[slot].offset = offset;
-  mmap_areas[slot].prot = prot;
-  mmap_areas[slot].flags = flags;
-  mmap_areas[slot].p = p;
+  mmap_table.entries[slot].f = f;
+  mmap_table.entries[slot].addr = va;
+  mmap_table.entries[slot].length = length;
+  mmap_table.entries[slot].offset = offset;
+  mmap_table.entries[slot].prot = prot;
+  mmap_table.entries[slot].flags = flags;
+  mmap_table.entries[slot].p = p;
+  release(&mmap_table.lock);
 
-  // Increase file reference count for file mappings
   if(f)
     filedup(f);
 
-  // If MAP_POPULATE, allocate pages and create page table entries now
   if(flags & MAP_POPULATE){
     for(int i = 0; i < length; i += PGSIZE){
       int file_off = offset + i;
       if(mmap_alloc_page(p->pagetable, va + i, prot, f, file_off, is_anon) < 0){
-        // Cleanup on failure: unmap already mapped pages
-        for(int j = 0; j < i; j += PGSIZE){
+        for(int j = 0; j < i; j += PGSIZE)
           uvmunmap(p->pagetable, va + j, 1, 1);
-        }
-        mmap_areas[slot].p = 0;
+        acquire(&mmap_table.lock);
+        mmap_table.entries[slot].p = 0;
+        mmap_table.entries[slot].f = 0;
+        release(&mmap_table.lock);
         if(f) fileclose(f);
         return 0;
       }
@@ -132,30 +140,29 @@ sys_munmap(void)
 
   argaddr(0, &addr);
 
-  // Check page alignment
   if(addr % PGSIZE != 0)
     return -1;
 
-  // Find the mmap_area for this process with matching addr
+  acquire(&mmap_table.lock);
   for(int i = 0; i < NMMAPAREA; i++){
-    if(mmap_areas[i].p == p && mmap_areas[i].addr == addr){
-      // Free any allocated physical pages and page table entries
-      for(int j = 0; j < mmap_areas[i].length; j += PGSIZE){
+    if(mmap_table.entries[i].p == p && mmap_table.entries[i].addr == addr){
+      struct mmap_area area = mmap_table.entries[i];
+      mmap_table.entries[i].p = 0;
+      mmap_table.entries[i].f = 0;
+      release(&mmap_table.lock);
+
+      for(int j = 0; j < area.length; j += PGSIZE){
         uint64 va = addr + j;
         pte_t *pte = walk(p->pagetable, va, 0);
-        if(pte && (*pte & PTE_V)){
+        if(pte && (*pte & PTE_V))
           uvmunmap(p->pagetable, va, 1, 1);
-        }
       }
-      // Close file reference
-      if(mmap_areas[i].f)
-        fileclose(mmap_areas[i].f);
-      // Clear the mmap_area
-      mmap_areas[i].p = 0;
-      mmap_areas[i].f = 0;
+      if(area.f)
+        fileclose(area.f);
       return 1;
     }
   }
+  release(&mmap_table.lock);
 
   return -1;
 }
@@ -174,48 +181,62 @@ mmap_page_fault(uint64 va, int is_write)
   struct proc *p = myproc();
   va = PGROUNDDOWN(va);
 
-  // Find the mmap_area containing this address
+  acquire(&mmap_table.lock);
   for(int i = 0; i < NMMAPAREA; i++){
-    if(mmap_areas[i].p != p)
+    if(mmap_table.entries[i].p != p)
       continue;
-    uint64 start = mmap_areas[i].addr;
-    uint64 end = start + mmap_areas[i].length;
+    uint64 start = mmap_table.entries[i].addr;
+    uint64 end = start + mmap_table.entries[i].length;
     if(va >= start && va < end){
-      // Found the mapping
-      // Check write permission
-      if(is_write && !(mmap_areas[i].prot & PROT_WRITE))
+      if(is_write && !(mmap_table.entries[i].prot & PROT_WRITE)){
+        release(&mmap_table.lock);
         return -1;
+      }
 
-      // Check if page is already mapped
+      // Snapshot before releasing lock; the slot itself remains held
+      // by this process's mmap_area, so it stays valid for our use.
+      int prot = mmap_table.entries[i].prot;
+      int flags = mmap_table.entries[i].flags;
+      int offset = mmap_table.entries[i].offset;
+      struct file *f = mmap_table.entries[i].f;
+      release(&mmap_table.lock);
+
       if(ismapped(p->pagetable, va))
         return 1;
 
-      int is_anon = (mmap_areas[i].flags & MAP_ANONYMOUS) != 0;
-      int file_off = mmap_areas[i].offset + (va - start);
+      int is_anon = (flags & MAP_ANONYMOUS) != 0;
+      int file_off = offset + (va - start);
 
-      if(mmap_alloc_page(p->pagetable, va, mmap_areas[i].prot,
-                         mmap_areas[i].f, file_off, is_anon) < 0)
+      if(mmap_alloc_page(p->pagetable, va, prot, f, file_off, is_anon) < 0)
         return -1;
 
       return 1;
     }
   }
+  release(&mmap_table.lock);
 
   return -1;
 }
 
 // Copy mmap_areas from parent to child process during fork.
+// Called with parent's process lock-free state but child not yet running.
 void
 mmap_fork(struct proc *parent, struct proc *child)
 {
+  // Two-phase: snapshot parent entries under lock, then materialize
+  // child copies (allocating new slots) with lock held; finally copy
+  // pages without holding the lock (kalloc/mappages can be slow).
+  struct mmap_area copies[NMMAPAREA];
+  int ncopies = 0;
+
+  acquire(&mmap_table.lock);
   for(int i = 0; i < NMMAPAREA; i++){
-    if(mmap_areas[i].p != parent)
+    if(mmap_table.entries[i].p != parent)
       continue;
 
-    // Find a free slot for child
     int slot = -1;
     for(int j = 0; j < NMMAPAREA; j++){
-      if(mmap_areas[j].p == 0){
+      if(mmap_table.entries[j].p == 0){
         slot = j;
         break;
       }
@@ -223,17 +244,18 @@ mmap_fork(struct proc *parent, struct proc *child)
     if(slot == -1)
       continue;
 
-    // Copy mmap_area entry
-    mmap_areas[slot] = mmap_areas[i];
-    mmap_areas[slot].p = child;
+    mmap_table.entries[slot] = mmap_table.entries[i];
+    mmap_table.entries[slot].p = child;
+    copies[ncopies++] = mmap_table.entries[slot];
+  }
+  release(&mmap_table.lock);
 
-    // Increase file reference count
-    if(mmap_areas[slot].f)
-      filedup(mmap_areas[slot].f);
+  for(int k = 0; k < ncopies; k++){
+    if(copies[k].f)
+      filedup(copies[k].f);
 
-    // Copy any already-mapped pages
-    uint64 start = mmap_areas[i].addr;
-    int length = mmap_areas[i].length;
+    uint64 start = copies[k].addr;
+    int length = copies[k].length;
     for(int j = 0; j < length; j += PGSIZE){
       uint64 va = start + j;
       pte_t *pte = walk(parent->pagetable, va, 0);
@@ -244,9 +266,8 @@ mmap_fork(struct proc *parent, struct proc *child)
         if(mem == 0)
           continue;
         memmove(mem, (char*)pa, PGSIZE);
-        if(mappages(child->pagetable, va, PGSIZE, (uint64)mem, flags) != 0){
+        if(mappages(child->pagetable, va, PGSIZE, (uint64)mem, flags) != 0)
           kfree(mem);
-        }
       }
     }
   }
@@ -256,25 +277,29 @@ mmap_fork(struct proc *parent, struct proc *child)
 void
 mmap_cleanup(struct proc *p)
 {
+  // Snapshot entries to free under lock, then perform expensive
+  // unmap/file-close work without the lock held.
+  struct mmap_area to_free[NMMAPAREA];
+  int n = 0;
+
+  acquire(&mmap_table.lock);
   for(int i = 0; i < NMMAPAREA; i++){
-    if(mmap_areas[i].p != p)
+    if(mmap_table.entries[i].p != p)
       continue;
+    to_free[n++] = mmap_table.entries[i];
+    mmap_table.entries[i].p = 0;
+    mmap_table.entries[i].f = 0;
+  }
+  release(&mmap_table.lock);
 
-    // Free any allocated physical pages
-    for(int j = 0; j < mmap_areas[i].length; j += PGSIZE){
-      uint64 va = mmap_areas[i].addr + j;
+  for(int k = 0; k < n; k++){
+    for(int j = 0; j < to_free[k].length; j += PGSIZE){
+      uint64 va = to_free[k].addr + j;
       pte_t *pte = walk(p->pagetable, va, 0);
-      if(pte && (*pte & PTE_V)){
+      if(pte && (*pte & PTE_V))
         uvmunmap(p->pagetable, va, 1, 1);
-      }
     }
-
-    // Close file reference
-    if(mmap_areas[i].f)
-      fileclose(mmap_areas[i].f);
-
-    // Clear entry
-    mmap_areas[i].p = 0;
-    mmap_areas[i].f = 0;
+    if(to_free[k].f)
+      fileclose(to_free[k].f);
   }
 }
